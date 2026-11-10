@@ -21,7 +21,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ZIP=$(find . -maxdepth 1 -type f \( -iname 'XWebApp-source*.zip' \) | sort | tail -n 1)
+          ZIP=$(find . -maxdepth 1 -type f -iname 'XWebApp-source*.zip' | sort | tail -n 1)
           if [ -z "${ZIP:-}" ]; then
             echo 'No XWebApp-source*.zip found in repository root.'
             exit 1
@@ -36,17 +36,24 @@ jobs:
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
           echo "Using project: $PROJECT"
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 21 (StarJump baseline)
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - uses: android-actions/setup-android@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.1"
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.1"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle 8.10.2 (StarJump baseline)
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
@@ -54,25 +61,28 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Verify APK size
+      - name: Verify APK size and generate SHA256
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          APK=app/build/outputs/apk/debug/app-debug.apk
+          APK="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
           SIZE=$(stat -c%s "$APK")
           MIN=$((20 * 1024 * 1024))
           echo "APK size: $SIZE bytes"
+          ls -lh "$APK"
+          sha256sum "$APK" | tee app-debug.apk.sha256
           if [ "$SIZE" -le "$MIN" ]; then
-            echo 'APK is not larger than 20 MiB; refusing to mark build as passed.'
+            echo "::error::APK must be strictly larger than 20 MiB. Build stopped; no padding will be added."
             exit 1
           fi
-          sha256sum "$APK" > "$APK.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK and checksum
+        uses: actions/upload-artifact@v4
         with:
           name: X-WebApp-debug-apk
           path: |
             ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
-            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk.sha256
+            ${{ env.PROJECT_DIR }}/app-debug.apk.sha256
+          if-no-files-found: error
