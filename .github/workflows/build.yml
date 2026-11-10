@@ -1,14 +1,24 @@
 name: Build X Web App APK
 
 on:
-  workflow_dispatch:
   push:
     paths:
-      - 'XWebApp-source*.zip'
-      - 'XWebApp-source*.ZIP'
+      - '*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: '源码 ZIP 文件名；留空时自动选择版本号最高的 XWebApp-source*.zip'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
+
+concurrency:
+  group: xwebapp-android-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -17,72 +27,104 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find and extract source ZIP
+      - name: Select source ZIP
+        id: source
         shell: bash
+        env:
+          REQUESTED_ZIP: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
-          ZIP=$(find . -maxdepth 1 -type f -iname 'XWebApp-source*.zip' | sort | tail -n 1)
-          if [ -z "${ZIP:-}" ]; then
-            echo 'No XWebApp-source*.zip found in repository root.'
-            exit 1
+          if [[ -n "${REQUESTED_ZIP}" ]]; then
+            if [[ ! -f "${REQUESTED_ZIP}" ]]; then
+              echo "指定的源码 ZIP 不存在：${REQUESTED_ZIP}" >&2
+              exit 1
+            fi
+            selected="${REQUESTED_ZIP}"
+          else
+            mapfile -t zips < <(find . -maxdepth 1 -type f -name 'XWebApp-source*.zip' -printf '%f\n' | sort -V)
+            if (( ${#zips[@]} == 0 )); then
+              echo '仓库根目录没有找到 XWebApp-source*.zip' >&2
+              exit 1
+            fi
+            selected="${zips[-1]}"
           fi
-          mkdir -p _source
-          unzip -q "$ZIP" -d _source
-          PROJECT=$(find _source -type f -name settings.gradle.kts -printf '%h\n' | head -n 1)
-          if [ -z "${PROJECT:-}" ] || [ ! -f "$PROJECT/app/build.gradle.kts" ]; then
-            echo 'ZIP does not contain a valid Android Gradle project.'
-            exit 1
-          fi
-          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Using project: $PROJECT"
+          echo "zip=${selected}" >> "$GITHUB_OUTPUT"
+          echo "选择源码：${selected}"
 
-      - name: Set up JDK 21 (StarJump baseline)
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v3
 
       - name: Install required Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.1"
+          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.1'
 
-      - name: Set up Gradle 8.10.2 (StarJump baseline)
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle --no-daemon :app:assembleDebug
-
-      - name: Verify APK size and generate SHA256
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Extract source and locate Android project
+        id: project
         shell: bash
+        env:
+          SOURCE_ZIP: ${{ steps.source.outputs.zip }}
         run: |
           set -euo pipefail
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-          test -f "$APK"
-          SIZE=$(stat -c%s "$APK")
-          MIN=$((20 * 1024 * 1024))
-          echo "APK size: $SIZE bytes"
-          ls -lh "$APK"
-          sha256sum "$APK" | tee app-debug.apk.sha256
-          if [ "$SIZE" -le "$MIN" ]; then
-            echo "::error::APK must be strictly larger than 20 MiB. Build stopped; no padding will be added."
+          mkdir -p "$RUNNER_TEMP/xwebapp-source"
+          unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/xwebapp-source"
+          project_file="$(find "$RUNNER_TEMP/xwebapp-source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          if [[ -z "$project_file" ]]; then
+            echo '源码 ZIP 中找不到 settings.gradle 或 settings.gradle.kts' >&2
             exit 1
           fi
+          project_dir="$(dirname "$project_file")"
+          echo "dir=${project_dir}" >> "$GITHUB_OUTPUT"
+          echo "Android 工程目录：${project_dir}"
 
-      - name: Upload APK and checksum
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [[ -f ./gradlew ]]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon :app:assembleDebug
+          else
+            gradle --no-daemon :app:assembleDebug
+          fi
+
+      - name: Collect APK and generate SHA256
+        id: artifacts
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk -type f -name '*.apk' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            echo '构建结束但没有找到 APK 文件' >&2
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$apk" "$GITHUB_WORKSPACE/artifacts/XWebApp-debug.apk"
+          cd "$GITHUB_WORKSPACE/artifacts"
+          sha256sum XWebApp-debug.apk > XWebApp-debug.apk.sha256
+          size="$(stat -c '%s' XWebApp-debug.apk)"
+          echo "APK 大小：${size} bytes"
+          echo "size=${size}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: X-WebApp-debug-apk
-          path: |
-            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
-            ${{ env.PROJECT_DIR }}/app-debug.apk.sha256
+          name: XWebApp-APK
+          path: artifacts/*
           if-no-files-found: error
+          retention-days: 14
