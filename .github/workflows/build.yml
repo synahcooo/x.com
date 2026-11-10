@@ -1,0 +1,78 @@
+name: Build X Web App APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'XWebApp-source*.zip'
+      - 'XWebApp-source*.ZIP'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and extract source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=$(find . -maxdepth 1 -type f \( -iname 'XWebApp-source*.zip' \) | sort | tail -n 1)
+          if [ -z "${ZIP:-}" ]; then
+            echo 'No XWebApp-source*.zip found in repository root.'
+            exit 1
+          fi
+          mkdir -p _source
+          unzip -q "$ZIP" -d _source
+          PROJECT=$(find _source -type f -name settings.gradle.kts -printf '%h\n' | head -n 1)
+          if [ -z "${PROJECT:-}" ] || [ ! -f "$PROJECT/app/build.gradle.kts" ]; then
+            echo 'ZIP does not contain a valid Android Gradle project.'
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Using project: $PROJECT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Verify APK size
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -f "$APK"
+          SIZE=$(stat -c%s "$APK")
+          MIN=$((20 * 1024 * 1024))
+          echo "APK size: $SIZE bytes"
+          if [ "$SIZE" -le "$MIN" ]; then
+            echo 'APK is not larger than 20 MiB; refusing to mark build as passed.'
+            exit 1
+          fi
+          sha256sum "$APK" > "$APK.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: X-WebApp-debug-apk
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk.sha256
